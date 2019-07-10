@@ -1,4 +1,4 @@
-#!/usr/local/opt/python/bin/python3.7
+#!/usr/bin/env python
 # Copyright 2015 Luminal, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -46,8 +46,6 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.hmac import HMAC
 from cryptography.hazmat.primitives import constant_time
 
-from multiprocessing.dummy import Pool as ThreadPool
-
 _hash_classes = {
     'SHA': hashes.SHA1,
     'SHA224': hashes.SHA224,
@@ -63,7 +61,6 @@ LEGACY_NONCE = b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0
 DEFAULT_REGION = "us-east-1"
 PAD_LEN = 19  # number of digits in sys.maxint
 WILDCARD_CHAR = "*"
-THREAD_POOL_MAX_SIZE = 64
 
 
 class KeyService(object):
@@ -189,7 +186,7 @@ def value_or_filename(string):
 
 def csv_dump(dictionary):
     csvfile = StringIO()
-    csvwriter = csv.writer(csvfile, lineterminator=os.linesep)
+    csvwriter = csv.writer(csvfile)
     for key in dictionary:
         csvwriter.writerow([key, dictionary[key]])
     return csvfile.getvalue()
@@ -260,28 +257,14 @@ def listSecrets(region=None, table="credential-store", **kwargs):
     dynamodb = session.resource('dynamodb', region_name=region)
     secrets = dynamodb.Table(table)
 
-    last_evaluated_key = True
-    items = []
-
-    while last_evaluated_key:
-        params = dict(
-            ProjectionExpression="#N, version, #C",
-            ExpressionAttributeNames={"#N": "name", "#C": "comment"}
-        )
-        if last_evaluated_key is not True:
-            params['ExclusiveStartKey'] = last_evaluated_key
-
-        response = secrets.scan(**params)
-
-        last_evaluated_key = response.get('LastEvaluatedKey')  # will set last evaluated key to a number
-        items.extend(response['Items'])
-
-    return items
+    response = secrets.scan(ProjectionExpression="#N, version",
+                            ExpressionAttributeNames={"#N": "name"})
+    return response["Items"]
 
 
 def putSecret(name, secret, version="", kms_key="alias/credstash",
               region=None, table="credential-store", context=None,
-              digest=DEFAULT_DIGEST, comment="", **kwargs):
+              digest=DEFAULT_DIGEST, **kwargs):
     '''
     put a secret called `name` into the secret-store,
     protected by the key kms_key
@@ -304,8 +287,6 @@ def putSecret(name, secret, version="", kms_key="alias/credstash",
         'name': name,
         'version': paddedInt(version),
     }
-    if comment:
-        data['comment'] = comment
     data.update(sealed)
 
     return secrets.put_item(Item=data, ConditionExpression=Attr('name').not_exists())
@@ -316,6 +297,7 @@ def getAllSecrets(version="", region=None, table="credential-store",
     '''
     fetch and decrypt all secrets
     '''
+    output = {}
     if session is None:
         session = get_session(**kwargs)
     dynamodb = session.resource('dynamodb', region_name=region)
@@ -332,14 +314,19 @@ def getAllSecrets(version="", region=None, table="credential-store",
     else:
         names = set(x["name"] for x in secrets)
 
-    pool = ThreadPool(min(len(names), THREAD_POOL_MAX_SIZE))
-    results = pool.map(
-        lambda credential: getSecret(credential, version, region, table, context, dynamodb, kms, **kwargs),
-        names)
-    pool.close()
-    pool.join()
-    return dict(zip(names, results))
-
+    for credential in names:
+        try:
+            output[credential] = getSecret(credential,
+                                           version,
+                                           region,
+                                           table,
+                                           context,
+                                           dynamodb,
+                                           kms,
+                                           **kwargs)
+        except:
+            pass
+    return output
 
 
 @clean_fail
@@ -383,7 +370,7 @@ def putSecretAction(args, region, **session_params):
     try:
         if putSecret(args.credential, args.value, version,
                      kms_key=args.key, region=region, table=args.table,
-                     context=args.context, digest=args.digest, comment=args.comment,
+                     context=args.context, digest=args.digest,
                      **session_params):
             print("{0} has been stored".format(args.credential))
     except KmsError as e:
@@ -401,19 +388,6 @@ def putSecretAction(args, region, **session_params):
 
 
 @clean_fail
-def putAllSecretsAction(args, region, **session_params):
-    credentials = json.loads(args.credentials)
-
-    for credential, value in credentials.items():
-        try:
-            args.credential = credential
-            args.value = value
-            putSecretAction(args, region, **session_params)
-        except SystemExit as e:
-            pass
-
-
-@clean_fail
 def getSecretAction(args, region, **session_params):
     try:
         if WILDCARD_CHAR in args.credential:
@@ -423,29 +397,14 @@ def getSecretAction(args, region, **session_params):
                                      in listSecrets(region=region,
                                                     table=args.table,
                                                     **session_params)])
-            secrets = dict((name,
-                            getSecret(name,
-                                      args.version,
-                                      region=region,
-                                      table=args.table,
-                                      context=args.context,
-                                      **session_params))
-                          for name in names)
-            if args.format == "json":
-                output_func = json.dumps
-                output_args = {"sort_keys": True,
-                               "indent": 4,
-                               "separators": (',', ': ')}
-            elif not NO_YAML and args.format == "yaml":
-                output_func = yaml.dump
-                output_args = {"default_flow_style": False}
-            elif args.format == 'csv':
-                output_func = csv_dump
-                output_args = {}
-            elif args.format == 'dotenv':
-                output_func = dotenv_dump
-                output_args = {}
-            sys.stdout.write(output_func(secrets, **output_args))
+            print(json.dumps(dict((name,
+                                   getSecret(name,
+                                             args.version,
+                                             region=region,
+                                             table=args.table,
+                                             context=args.context,
+                                             **session_params))
+                                  for name in names)))
         else:
             sys.stdout.write(getSecret(args.credential, args.version,
                                        region=region, table=args.table,
@@ -682,21 +641,8 @@ def list_credentials(region, args, **session_params):
         max_len = max([len(x["name"]) for x in credential_list])
         for cred in sorted(credential_list,
                            key=operator.itemgetter("name", "version")):
-            print("{0:{1}} -- version {2:>} -- comment {3}".format(
-                cred["name"], max_len, cred["version"], cred.get("comment", "")))
-    else:
-        return
-
-
-@clean_fail
-def list_credential_keys(region, args, **session_params):
-    credential_list = listSecrets(region=region,
-                                  table=args.table,
-                                  **session_params)
-    if credential_list:
-        creds = sorted(set([cred["name"] for cred in credential_list]))
-        for cred in creds:
-            print(cred)
+            print("{0:{1}} -- version {2:>}".format(
+                cred["name"], max_len, cred["version"]))
     else:
         return
 
@@ -750,7 +696,7 @@ def get_parser():
     parsers[action] = subparsers.add_parser(action, help="Get a credential "
                                             "from the store")
     parsers[action].add_argument("credential", type=str,
-                                 help="the name of the credential to get. "
+                                 help="the name of the credential to get."
                                  "Using the wildcard character '%s' will "
                                  "search for credentials that match the "
                                  "pattern" % WILDCARD_CHAR)
@@ -766,11 +712,6 @@ def get_parser():
     parsers[action].add_argument("-v", "--version", default="",
                                  help="Get a specific version of the "
                                  "credential (defaults to the latest version)")
-    parsers[action].add_argument("-f", "--format", default="json",
-                                 choices=["json", "csv", "dotenv"] +
-                                 ([] if NO_YAML else ["yaml"]),
-                                 help="Output format. json(default) " +
-                                 ("" if NO_YAML else "yaml ") + " csv or dotenv.")
     parsers[action].set_defaults(action=action)
 
     action = 'getall'
@@ -790,11 +731,6 @@ def get_parser():
                                  ([] if NO_YAML else ["yaml"]),
                                  help="Output format. json(default) " +
                                  ("" if NO_YAML else "yaml ") + " csv or dotenv.")
-    parsers[action].set_defaults(action=action)
-
-    action = 'keys'
-    parsers[action] = subparsers.add_parser(action,
-                                            help="List all keys in the store")
     parsers[action].set_defaults(action=action)
 
     action = 'list'
@@ -824,10 +760,7 @@ def get_parser():
                                  help="the KMS key-id of the master key "
                                  "to use. See the README for more "
                                  "information. Defaults to alias/credstash")
-    parsers[action].add_argument("-c", "--comment", type=str,
-                                 help="Include reference information or a comment about "
-                                 "value to be stored.")
-    parsers[action].add_argument("-v", "--version", default="1",
+    parsers[action].add_argument("-v", "--version", default="",
                                  help="Put a specific version of the "
                                  "credential (update the credential; "
                                  "defaults to version `1`).")
@@ -843,40 +776,6 @@ def get_parser():
                                  "to encrypt the data. Defaults to SHA256")
     parsers[action].set_defaults(action=action)
 
-    action = 'putall'
-    parsers[action] = subparsers.add_parser(action,
-                                            help="Put credentials from json into "
-                                                 "the store")
-    parsers[action].add_argument("credentials", type=value_or_filename,
-                                 help="the value of the credential to store "
-                                      "or, if beginning with the \"@\" character, "
-                                      "the filename of the file containing "
-                                      "the values, or pass \"-\" to read the values "
-                                      "from stdin. Should be in json format.", default="")
-    parsers[action].add_argument("context", type=key_value_pair,
-                                 action=KeyValueToDictionary, nargs='*',
-                                 help="encryption context key/value pairs "
-                                      "associated with the credential in the form "
-                                      "of \"key=value\"")
-    parsers[action].add_argument("-k", "--key", default="alias/credstash",
-                                 help="the KMS key-id of the master key "
-                                      "to use. See the README for more "
-                                      "information. Defaults to alias/credstash")
-    parsers[action].add_argument("-v", "--version", default="",
-                                 help="Put a specific version of the "
-                                      "credential (update the credential; "
-                                      "defaults to version `1`).")
-    parsers[action].add_argument("-a", "--autoversion", action="store_true",
-                                 help="Automatically increment the version of "
-                                      "the credential to be stored. This option "
-                                      "causes the `-v` flag to be ignored. "
-                                      "(This option will fail if the currently stored "
-                                      "version is not numeric.)")
-    parsers[action].add_argument("-d", "--digest", default="SHA256",
-                                 choices=HASHING_ALGORITHMS,
-                                 help="the hashing algorithm used to "
-                                      "to encrypt the data. Defaults to SHA256")
-    parsers[action].set_defaults(action=action)
     action = 'setup'
     parsers[action] = subparsers.add_parser(action,
                                             help='setup the credential store')
@@ -909,14 +808,8 @@ def main():
         if args.action == "list":
             list_credentials(region, args, **session_params)
             return
-        if args.action == "keys":
-            list_credential_keys(region, args, **session_params)
-            return
         if args.action == "put":
             putSecretAction(args, region, **session_params)
-            return
-        if args.action == "putall":
-            putAllSecretsAction(args, region, **session_params)
             return
         if args.action == "get":
             getSecretAction(args, region, **session_params)
